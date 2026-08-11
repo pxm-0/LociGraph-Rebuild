@@ -1,0 +1,141 @@
+import { render, screen, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import { expect, vi, describe, it, beforeEach } from "vitest"
+import { ThemeProvider } from "@/lib/theme"
+import type { Claim } from "@/lib/types"
+import ClaimsPage from "./page"
+
+vi.mock("@/lib/api", () => ({
+  listClaims: vi.fn(),
+  getClaimsCount: vi.fn().mockResolvedValue(0),
+  listConceptCandidates: vi.fn().mockResolvedValue([]),
+}))
+
+import { getClaimsCount, listClaims } from "@/lib/api"
+const mockListClaims = vi.mocked(listClaims)
+const mockGetClaimsCount = vi.mocked(getClaimsCount)
+
+function makeClaims(count: number, offset = 0): Claim[] {
+  return Array.from({ length: count }, (_, i) => ({
+    id: `c${offset + i}`,
+    sourceId: "src-1",
+    observationId: "obs-1",
+    claimText: `claim ${offset + i}`,
+    claimType: "fact",
+    assertionType: "reality",
+    confidence: 0.9,
+    extractionMethod: "llm",
+    modelName: null,
+    promptVersion: null,
+    status: "proposed",
+    createdAt: "2024-05-12T14:32:01Z",
+  }))
+}
+
+function renderPage() {
+  return render(
+    <ThemeProvider>
+      <ClaimsPage />
+    </ThemeProvider>,
+  )
+}
+
+describe("ClaimsPage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("loads the first page with limit/offset and shows claim text", async () => {
+    mockListClaims.mockResolvedValueOnce(makeClaims(2))
+    renderPage()
+
+    await waitFor(() => {
+      expect(mockListClaims).toHaveBeenCalledTimes(1)
+      expect(mockListClaims).toHaveBeenCalledWith({ limit: 100, offset: 0 })
+      expect(screen.getByText("claim 0")).toBeInTheDocument()
+    })
+  })
+
+  it("shows Load more when a full page is returned, and appends the next page on click", async () => {
+    mockListClaims.mockResolvedValueOnce(makeClaims(100))
+    mockGetClaimsCount.mockResolvedValueOnce(150)
+    renderPage()
+
+    await waitFor(() => {
+      expect(screen.getByText("claim 0")).toBeInTheDocument()
+    })
+
+    const loadMoreBtn = screen.getByRole("button", { name: /load more/i })
+    mockListClaims.mockResolvedValueOnce(makeClaims(50, 100))
+    await userEvent.click(loadMoreBtn)
+
+    await waitFor(() => {
+      expect(mockListClaims).toHaveBeenCalledWith({ limit: 100, offset: 100 })
+      expect(screen.getByText("claim 0")).toBeInTheDocument()
+      expect(screen.getByText("claim 100")).toBeInTheDocument()
+    })
+  })
+
+  it("does not show Load more when the first page is short", async () => {
+    mockListClaims.mockResolvedValueOnce(makeClaims(10))
+    mockGetClaimsCount.mockResolvedValueOnce(10)
+    renderPage()
+
+    await waitFor(() => {
+      expect(screen.getByText("claim 0")).toBeInTheDocument()
+    })
+
+    expect(screen.queryByRole("button", { name: /load more/i })).not.toBeInTheDocument()
+  })
+
+  it("hides Load more after a short subsequent page is loaded", async () => {
+    mockListClaims.mockResolvedValueOnce(makeClaims(100))
+    mockGetClaimsCount.mockResolvedValueOnce(110)
+    renderPage()
+
+    const loadMoreBtn = await screen.findByRole("button", { name: /load more/i })
+    mockListClaims.mockResolvedValueOnce(makeClaims(10, 100))
+    await userEvent.click(loadMoreBtn)
+
+    await waitFor(() => {
+      expect(screen.getByText("claim 100")).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: /load more/i })).not.toBeInTheDocument()
+    })
+  })
+
+  it("shows inline error when loadMore fetch fails", async () => {
+    mockListClaims.mockResolvedValueOnce(makeClaims(100))
+    mockGetClaimsCount.mockResolvedValueOnce(150)
+    renderPage()
+
+    const loadMoreBtn = await screen.findByRole("button", { name: /load more/i })
+    mockListClaims.mockRejectedValueOnce(new Error("network error"))
+    await userEvent.click(loadMoreBtn)
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toBeInTheDocument()
+    })
+  })
+
+  it("filters by assertion type", async () => {
+    const reality = { ...makeClaims(1)[0], id: "c-reality", claimText: "reality claim", assertionType: "reality" }
+    const perception = {
+      ...makeClaims(1)[0],
+      id: "c-perception",
+      claimText: "perception claim",
+      assertionType: "perception",
+    }
+    mockListClaims.mockResolvedValueOnce([reality, perception])
+    renderPage()
+
+    await waitFor(() => {
+      expect(screen.getByText("reality claim")).toBeInTheDocument()
+      expect(screen.getByText("perception claim")).toBeInTheDocument()
+    })
+
+    await userEvent.click(screen.getByRole("button", { name: "perception" }))
+
+    expect(screen.queryByText("reality claim")).not.toBeInTheDocument()
+    expect(screen.getByText("perception claim")).toBeInTheDocument()
+  })
+})

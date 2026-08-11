@@ -1,0 +1,128 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: locigraph
+      POSTGRES_USER: locigraph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locigraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://locigraph_app:${APP_DB_PASSWORD:-changeme}@postgres/locigraph
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://locigraph:${POSTGRES_PASSWORD:-changeme}@postgres/locigraph
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-changeme-generate-with-openssl-rand-hex-32}
+      LOCIGRAPH_EMAIL: ${LOCIGRAPH_EMAIL:-you@example.com}
+      LOCIGRAPH_PASSWORD: ${LOCIGRAPH_PASSWORD:-changeme}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-changeme}
+      RAW_STORAGE_PATH: /data/raw
+      ACTIVE_AI_PROVIDER: ${ACTIVE_AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EXTRACTION_MODEL: ${OPENAI_EXTRACTION_MODEL:-gpt-5.4-nano}
+      CLAIM_EXTRACTION_AUTORUN: ${CLAIM_EXTRACTION_AUTORUN:-false}
+      CLAIM_EXTRACTION_BATCH_SIZE: ${CLAIM_EXTRACTION_BATCH_SIZE:-12}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_AUTORUN: ${EMBEDDING_AUTORUN:-false}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      OPENAI_CONTRADICTION_MODEL: ${OPENAI_CONTRADICTION_MODEL:-gpt-5.4-mini}
+      CONTRADICTION_CANDIDATE_LIMIT: ${CONTRADICTION_CANDIDATE_LIMIT:-5}
+      CONTRADICTION_SIMILARITY_FLOOR: ${CONTRADICTION_SIMILARITY_FLOOR:-0.75}
+      CONTRADICTION_AUTORUN: ${CONTRADICTION_AUTORUN:-false}
+      OPENAI_REVISION_MODEL: ${OPENAI_REVISION_MODEL:-gpt-5.4-mini}
+      OPENAI_CUSTODIAN_MODEL: ${OPENAI_CUSTODIAN_MODEL:-gpt-5.6-terra}
+      CUSTODIAN_MAX_MESSAGES_PER_SESSION: ${CUSTODIAN_MAX_MESSAGES_PER_SESSION:-100}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+    volumes:
+      - raw_data:/data/raw
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://locigraph_app:${APP_DB_PASSWORD:-changeme}@postgres/locigraph
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-changeme-generate-with-openssl-rand-hex-32}
+      LOCIGRAPH_EMAIL: ${LOCIGRAPH_EMAIL:-you@example.com}
+      LOCIGRAPH_PASSWORD: ${LOCIGRAPH_PASSWORD:-changeme}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-changeme}
+      RAW_STORAGE_PATH: /data/raw
+      ACTIVE_AI_PROVIDER: ${ACTIVE_AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EXTRACTION_MODEL: ${OPENAI_EXTRACTION_MODEL:-gpt-5.4-nano}
+      CLAIM_EXTRACTION_AUTORUN: ${CLAIM_EXTRACTION_AUTORUN:-false}
+      CLAIM_EXTRACTION_BATCH_SIZE: ${CLAIM_EXTRACTION_BATCH_SIZE:-12}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_AUTORUN: ${EMBEDDING_AUTORUN:-false}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      OPENAI_CONTRADICTION_MODEL: ${OPENAI_CONTRADICTION_MODEL:-gpt-5.4-mini}
+      CONTRADICTION_CANDIDATE_LIMIT: ${CONTRADICTION_CANDIDATE_LIMIT:-5}
+      CONTRADICTION_SIMILARITY_FLOOR: ${CONTRADICTION_SIMILARITY_FLOOR:-0.75}
+      CONTRADICTION_AUTORUN: ${CONTRADICTION_AUTORUN:-false}
+      OPENAI_REVISION_MODEL: ${OPENAI_REVISION_MODEL:-gpt-5.4-mini}
+      OPENAI_CUSTODIAN_MODEL: ${OPENAI_CUSTODIAN_MODEL:-gpt-5.6-terra}
+      CUSTODIAN_MAX_MESSAGES_PER_SESSION: ${CUSTODIAN_MAX_MESSAGES_PER_SESSION:-100}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+    volumes:
+      - raw_data:/data/raw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_ORIGIN: http://backend:8000
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "${CADDY_PORT:-80}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:
+  raw_data:

@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Secrets / env
+.env
+
+# Node / Next.js
+node_modules/
+.next/
+
+# Runtime data / volumes
+data/
+caddy_data/
+postgres_data/
+backups/
+
+# Claude local settings
+.claude/settings.local.json
+
+# Subagent-driven-development scratch (progress ledger, review packages)
+.superpowers/

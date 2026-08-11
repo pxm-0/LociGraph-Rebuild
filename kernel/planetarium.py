@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import UTC, datetime
+from uuid import UUID
+
+import numpy as np
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from kernel.db.claim_concept_edges import ClaimConceptEdgeRepository
+from kernel.db.concepts import ConceptRepository
+from kernel.db.contradictions import ContradictionRepository
+from kernel.db.importance_signals import ImportanceSignalRepository
+from kernel.db.planetary_nodes import PlanetaryNodeRepository
+from kernel.db.revisions import RevisionRepository
+from kernel.db.semantic_vectors import SemanticVectorRepository
+from kernel.models import (
+    ClaimConceptEdge,
+    Contradiction,
+    ImportanceSignal,
+    PlanetaryNode,
+    Revision,
+    SemanticVector,
+)
+from kernel.planetarium_physics import (
+    MASS_FORMULA_VERSION,
+    classify_visual_class,
+    color_for_visual_class,
+    compute_brightness,
+    compute_mass,
+    mass_percentiles,
+    node_radius,
+    normalize,
+    spherical_from_cartesian,
+)
+from kernel.planetarium_projection import (
+    PROJECTION_ALGORITHM,
+    PROJECTION_VERSION,
+    fibonacci_sphere,
+    project_concepts,
+    scene_radius_for,
+)
+
+# Generous cap on concepts fetched per rebuild — a personal archive's concept
+# count is expected to stay far below this; it exists so the query has an
+# explicit LIMIT rather than none, matching every other paginated repository
+# method here.
+MAX_ROWS_PER_CONCEPT = 10_000
+
+
+async def rebuild_planetarium(conn: AsyncConnection, user_id: str | UUID) -> list[PlanetaryNode]:
+    concepts = await ConceptRepository(conn).list(limit=MAX_ROWS_PER_CONCEPT)
+    if not concepts:
+        return await PlanetaryNodeRepository(conn).replace_all_for_user(user_id, [])
+
+    concept_ids = [concept.id for concept in concepts]
+    revision_repo = RevisionRepository(conn)
+    edge_repo = ClaimConceptEdgeRepository(conn)
+    contradiction_repo = ContradictionRepository(conn)
+    signal_repo = ImportanceSignalRepository(conn)
+    vector_repo = SemanticVectorRepository(conn)
+
+    # One bulk query per related table instead of one per concept — with N
+    # concepts the old per-concept loop issued 5*N sequential round trips,
+    # which is what made rebuilds slow as an archive grew.
+    revisions_by_concept: dict[UUID, list[Revision]] = defaultdict(list)
+    for revision in await revision_repo.list_for_concepts(concept_ids):
+        revisions_by_concept[revision.concept_id].append(revision)
+    edges_by_concept: dict[UUID, list[ClaimConceptEdge]] = defaultdict(list)
+    for edge in await edge_repo.list_for_concepts(concept_ids):
+        edges_by_concept[edge.concept_id].append(edge)
+    contradictions_by_concept: dict[UUID, list[Contradiction]] = defaultdict(list)
+    for contradiction in await contradiction_repo.list_for_concepts(concept_ids):
+        contradictions_by_concept[contradiction.concept_id].append(contradiction)
+    pins_by_concept: dict[UUID, list[ImportanceSignal]] = defaultdict(list)
+    for pin in await signal_repo.list_for_targets("concept", concept_ids):
+        pins_by_concept[pin.target_id].append(pin)
+    vectors_by_concept: dict[UUID, list[SemanticVector]] = defaultdict(list)
+    for vector_concept_id, vector in await vector_repo.list_for_concepts(concept_ids):
+        vectors_by_concept[vector_concept_id].append(vector)
+
+    revision_counts: dict[str, float] = {}
+    edge_counts: dict[str, float] = {}
+    contradiction_counts: dict[str, float] = {}
+    pin_counts: dict[str, float] = {}
+    days_since_activity: dict[str, float] = {}
+    embeddings: dict[UUID, list[float]] = {}
+    now = datetime.now(UTC)
+
+    for concept in concepts:
+        cid = str(concept.id)
+        revisions = revisions_by_concept[concept.id]
+        concept_edges = edges_by_concept[concept.id]
+        contradictions = contradictions_by_concept[concept.id]
+        pins = pins_by_concept[concept.id]
+        vectors = vectors_by_concept[concept.id]
+
+        revision_counts[cid] = float(len(revisions))
+        edge_counts[cid] = float(len(concept_edges))
+        contradiction_counts[cid] = float(len(contradictions))
+        pin_counts[cid] = float(len(pins))
+        if vectors:
+            embeddings[concept.id] = list(np.mean([v.embedding for v in vectors], axis=0))
+
+        timestamps = (
+            [concept.created_at]
+            + [r.created_at for r in revisions]
+            + [e.created_at for e in concept_edges]
+            + [c.created_at for c in contradictions]
+            + [p.created_at for p in pins]
+            + [v.created_at for v in vectors]
+        )
+        days_since_activity[cid] = (now - max(timestamps)).total_seconds() / 86400.0
+
+    normalized_revision = normalize(revision_counts)
+    normalized_edge = normalize(edge_counts)
+    normalized_contradiction = normalize(contradiction_counts)
+    normalized_pin = normalize(pin_counts)
+
+    masses = {
+        cid: compute_mass(
+            normalized_revision=normalized_revision[cid],
+            normalized_edge=normalized_edge[cid],
+            normalized_contradiction=normalized_contradiction[cid],
+            normalized_pin=normalized_pin[cid],
+        )
+        for cid in revision_counts
+    }
+    normalized_mass = normalize(masses)
+    percentiles = mass_percentiles(masses)
+    # Radius scales with node count so the layout keeps a constant breathing
+    # room between planets rather than getting denser as the archive grows.
+    scene_radius = scene_radius_for(len(concepts))
+    positions = project_concepts(embeddings, radius=scene_radius)
+
+    # Concepts without an embedding get no UMAP position; spread them on a shell
+    # instead of collapsing every one onto (0,0,0) (which piled all planets into
+    # a single overlapping blob).
+    # ponytail: embedded cluster and this shell share scene_radius, so in the
+    # rare mixed case they can touch at the boundary; widen the shell radius if
+    # that ever looks crowded.
+    unplaced = [concept.id for concept in concepts if concept.id not in positions]
+    fallback = dict(zip(unplaced, fibonacci_sphere(len(unplaced), scene_radius), strict=True))
+
+    nodes = []
+    for concept in concepts:
+        cid = str(concept.id)
+        x, y, z = (
+            positions[concept.id] if concept.id in positions else fallback[concept.id]
+        )
+        theta, phi = spherical_from_cartesian(x, y, z)
+        visual_class = classify_visual_class(
+            mass=masses[cid], mass_percentile=percentiles[cid], concept_count=len(concepts)
+        )
+        nodes.append(
+            {
+                "concept_id": concept.id,
+                "x": x,
+                "y": y,
+                "z": z,
+                "theta": theta,
+                "phi": phi,
+                "radius": node_radius(normalized_mass[cid]),
+                "mass": masses[cid],
+                "brightness": compute_brightness(days_since_activity[cid]),
+                "color": color_for_visual_class(visual_class),
+                "visual_class": visual_class,
+                "projection_version": f"{MASS_FORMULA_VERSION}/{PROJECTION_VERSION}",
+                "projection_algorithm": PROJECTION_ALGORITHM,
+            }
+        )
+    return await PlanetaryNodeRepository(conn).replace_all_for_user(user_id, nodes)
